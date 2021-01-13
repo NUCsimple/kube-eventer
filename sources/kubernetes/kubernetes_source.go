@@ -15,6 +15,9 @@
 package kubernetes
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/tools/cache"
 	"net/url"
 	"time"
 
@@ -23,9 +26,6 @@ import (
 	"github.com/AliyunContainerService/kube-eventer/common/kubernetes"
 	"github.com/AliyunContainerService/kube-eventer/core"
 	kubeapi "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	kubewatch "k8s.io/apimachinery/pkg/watch"
-
 	kubev1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/klog"
 )
@@ -66,14 +66,12 @@ func init() {
 	prometheus.MustRegister(scrapEventsDuration)
 }
 
-// Implements core.EventSource interface.
 type KubernetesEventSource struct {
 	// Large local buffer, periodically read.
 	localEventsBuffer chan *kubeapi.Event
-
-	stopChannel chan struct{}
-
-	eventClient kubev1core.EventInterface
+	informer          cache.SharedIndexInformer
+	stop              chan struct{}
+	eventClient       kubev1core.EventInterface
 }
 
 func (this *KubernetesEventSource) GetNewEvents() *core.EventBatch {
@@ -103,74 +101,27 @@ event_loop:
 }
 
 func (this *KubernetesEventSource) watch() {
-	// Outer loop, for reconnections.
-	for {
-		events, err := this.eventClient.List(metav1.ListOptions{})
-		if err != nil {
-			klog.Errorf("Failed to load events: %v", err)
-			time.Sleep(time.Second)
-			continue
-		}
-		// Do not write old events.
 
-		resourceVersion := events.ResourceVersion
-
-		watcher, err := this.eventClient.Watch(
-			metav1.ListOptions{
-				Watch:           true,
-				ResourceVersion: resourceVersion})
-		if err != nil {
-			klog.Errorf("Failed to start watch for new events: %v", err)
-			time.Sleep(time.Second)
-			continue
-		}
-
-		watchChannel := watcher.ResultChan()
-		// Inner loop, for update processing.
-	inner_loop:
-		for {
-			select {
-			case watchUpdate, ok := <-watchChannel:
-				if !ok {
-					klog.Errorf("Event watch channel closed")
-					break inner_loop
-				}
-
-				if watchUpdate.Type == kubewatch.Error {
-					if status, ok := watchUpdate.Object.(*metav1.Status); ok {
-						klog.Errorf("Error during watch: %#v", status)
-						break inner_loop
-					}
-					klog.Errorf("Received unexpected error: %#v", watchUpdate.Object)
-					break inner_loop
-				}
-
-				if event, ok := watchUpdate.Object.(*kubeapi.Event); ok {
-					switch watchUpdate.Type {
-					case kubewatch.Added, kubewatch.Modified:
-						select {
-						case this.localEventsBuffer <- event:
-							// Ok, buffer not full.
-						default:
-							// Buffer full, need to drop the event.
-							klog.Errorf("Event buffer full, dropping event")
-						}
-					case kubewatch.Deleted:
-						// Deleted events are silently ignored.
-					default:
-						klog.Warningf("Unknown watchUpdate.Type: %#v", watchUpdate.Type)
-					}
-				} else {
-					klog.Errorf("Wrong object received: %v", watchUpdate)
-				}
-
-			case <-this.stopChannel:
-				watcher.Stop()
-				klog.Infof("Event watching stopped")
-				return
+	this.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			event := obj.(*kubeapi.Event)
+			isNewEvent, _ := compareWithLastResourceVersion(this.eventClient, event.ResourceVersion)
+			if isNewEvent {
+				this.localEventsBuffer <- event
 			}
-		}
-	}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			event := newObj.(*kubeapi.Event)
+			isNewEvent, _ := compareWithLastResourceVersion(this.eventClient, event.ResourceVersion)
+			if isNewEvent {
+				this.localEventsBuffer <- event
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			// delete event not send
+		},
+	})
+	this.informer.Run(this.stop)
 }
 
 func NewKubernetesSource(uri *url.URL) (*KubernetesEventSource, error) {
@@ -179,12 +130,28 @@ func NewKubernetesSource(uri *url.URL) (*KubernetesEventSource, error) {
 		klog.Errorf("Failed to create kubernetes client,because of %v", err)
 		return nil, err
 	}
+
 	eventClient := kubeClient.CoreV1().Events(kubeapi.NamespaceAll)
-	result := KubernetesEventSource{
+
+	factory := informers.NewSharedInformerFactoryWithOptions(kubeClient, 30*time.Second, informers.WithNamespace(kubeapi.NamespaceAll))
+	informer := factory.Core().V1().Events().Informer()
+
+	k8sSource := &KubernetesEventSource{
 		localEventsBuffer: make(chan *kubeapi.Event, LocalEventsBufferSize),
-		stopChannel:       make(chan struct{}),
+		informer:          informer,
+		stop:              make(chan struct{}),
 		eventClient:       eventClient,
 	}
-	go result.watch()
-	return &result, nil
+
+	go k8sSource.watch()
+	return k8sSource, nil
+}
+
+func compareWithLastResourceVersion(client kubev1core.EventInterface, rv string) (bool, error) {
+	lists, err := client.List(metav1.ListOptions{})
+	if err != nil {
+		klog.Errorf("Failed to load events: %v", err)
+		return false, err
+	}
+	return rv > lists.ResourceVersion, nil
 }
