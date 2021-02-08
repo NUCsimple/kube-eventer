@@ -114,10 +114,12 @@ func (this *KubernetesEventSource) watch() {
 		// Do not write old events.
 
 		resourceVersion := events.ResourceVersion
+		timeoutSeconds := int64(800)
 
 		watcher, err := this.eventClient.Watch(
 			metav1.ListOptions{
 				Watch:           true,
+				TimeoutSeconds:  &timeoutSeconds,
 				ResourceVersion: resourceVersion})
 		if err != nil {
 			klog.Errorf("Failed to start watch for new events: %v", err)
