@@ -2,7 +2,6 @@ package webhook
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -75,13 +74,8 @@ func (ws *WebHookSink) Send(event *v1.Event) (err error) {
 		return err
 	}
 
-	marshalBytes, err := json.Marshal(body)
-	if err != nil {
-		klog.Errorf("Body marshal failed,because of %v", err)
-		return err
-	}
-
-	req, err := http.NewRequest(ws.method, ws.endpoint, strings.NewReader(string(marshalBytes)))
+	bodyBuffer := bytes.NewBuffer([]byte(body))
+	req, err := http.NewRequest(ws.method, ws.endpoint, bodyBuffer)
 
 	// append header to http request
 	if ws.headerMap != nil && len(ws.headerMap) != 0 {
